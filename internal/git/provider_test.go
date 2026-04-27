@@ -2,8 +2,8 @@ package git
 
 import (
 	"context"
-	"os/exec"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 
@@ -245,7 +245,7 @@ func setupTestRepo(t *testing.T) string {
 	t.Helper()
 	tmpDir := t.TempDir()
 	repoPath := filepath.Join(tmpDir, "test-repo")
-	require.NoError(t, os.MkdirAll(filepath.Join(repoPath, ".git"), 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Join(repoPath, ".git"), 0o750))
 	return repoPath
 }
 
@@ -617,7 +617,7 @@ func TestCreateNetrcCredentials(t *testing.T) {
 			password:   "testpass",
 			wantNilEnv: true,
 		},
-		{
+		{ //nolint:gosec // G101: test-only credentials, not real secrets
 			name:     "special characters in credentials written as-is",
 			repoURL:  "https://github.com/org/repo",
 			username: "user@corp",
@@ -652,7 +652,7 @@ func TestCreateNetrcCredentials(t *testing.T) {
 			require.NoError(t, err, ".netrc file should exist")
 			assert.Equal(t, os.FileMode(0o600), info.Mode().Perm(), ".netrc should be mode 0600")
 
-			content, err := os.ReadFile(netrcPath)
+			content, err := os.ReadFile(netrcPath) //nolint:gosec // G304: path is constructed from test temp dir
 			require.NoError(t, err)
 			contentStr := string(content)
 			assert.Contains(t, contentStr, "login "+tt.username)
