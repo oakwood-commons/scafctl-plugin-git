@@ -644,7 +644,7 @@ func createNetrcCredentials(repoURL, username, password string) (env []string, c
 		return nil, nil, fmt.Errorf("creating credential temp dir: %w", mkErr)
 	}
 
-	cleanupFn := func() { os.RemoveAll(tmpDir) } //nolint:errcheck
+	cleanupFn := func() { os.RemoveAll(tmpDir) } //nolint:errcheck,gosec // G104: cleanup func, error intentionally discarded
 
 	// Write .netrc (Unix) and _netrc (Windows / Git for Windows).
 	// The file names are hardcoded literals -- no path traversal is possible.
