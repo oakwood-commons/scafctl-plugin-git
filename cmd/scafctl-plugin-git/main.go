@@ -8,5 +8,5 @@ import (
 )
 
 func main() {
-	sdkplugin.Serve(&git.Plugin{})
+	sdkplugin.Serve(git.NewPlugin())
 }
