@@ -230,6 +230,16 @@ func TestExecuteProvider_Branch_MissingPath(t *testing.T) {
 	assert.Contains(t, err.Error(), "path")
 }
 
+func TestExecuteProvider_Remote_NonexistentPath(t *testing.T) {
+	p := NewPlugin()
+	_, err := p.ExecuteProvider(context.Background(), "git", map[string]any{
+		"operation": "remote",
+		"path":      "/nonexistent/path/that/does/not/exist",
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "directory does not exist")
+}
+
 func TestExecuteProvider_InvalidInputType(t *testing.T) {
 	p := NewPlugin()
 	// This should not be possible through the SDK interface but test defensive coding
@@ -306,6 +316,89 @@ func TestExecuteProvider_Tag_NonexistentPath(t *testing.T) {
 		"path":      "/nonexistent",
 	})
 	require.Error(t, err)
+}
+
+func TestExecuteProvider_Remote(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git command not available")
+	}
+
+	repoPath := t.TempDir()
+	runGit := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...) //nolint:gosec // G204: test-only, args are literals
+		cmd.Dir = repoPath
+		require.NoError(t, cmd.Run(), "git %v", args)
+	}
+	runGit("init")
+	runGit("remote", "add", "origin", "https://github.com/acme/widgets.git")
+
+	p := NewPlugin()
+	result, err := p.ExecuteProvider(context.Background(), "git", map[string]any{
+		"operation": "remote",
+		"path":      repoPath,
+		"remote":    "origin",
+	})
+	require.NoError(t, err)
+	require.NotNil(t, result)
+
+	data := result.Data.(map[string]any)
+	assert.Equal(t, "remote", data["operation"])
+	assert.Equal(t, repoPath, data["path"])
+	assert.Equal(t, "https://github.com/acme/widgets.git", data["url"])
+	assert.Equal(t, "github.com", data["host"])
+	assert.Equal(t, "acme", data["org"])
+	assert.Equal(t, "widgets", data["repo"])
+	assert.Equal(t, "https://github.com/acme/widgets", data["httpUrl"])
+	assert.Equal(t, "git@github.com:acme/widgets.git", data["sshUrl"])
+}
+
+func TestExecuteProvider_Remote_DefaultRemote(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git command not available")
+	}
+
+	repoPath := t.TempDir()
+	runGit := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...) //nolint:gosec // G204: test-only, args are literals
+		cmd.Dir = repoPath
+		require.NoError(t, cmd.Run(), "git %v", args)
+	}
+	runGit("init")
+	runGit("remote", "add", "origin", "git@github.com:acme/widgets.git")
+
+	p := NewPlugin()
+	result, err := p.ExecuteProvider(context.Background(), "git", map[string]any{
+		"operation": "remote",
+		"path":      repoPath,
+	})
+	require.NoError(t, err)
+
+	data := result.Data.(map[string]any)
+	assert.Equal(t, "github.com", data["host"])
+	assert.Equal(t, "acme", data["org"])
+	assert.Equal(t, "widgets", data["repo"])
+}
+
+func TestExecuteProvider_Remote_UnknownRemote(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git command not available")
+	}
+
+	repoPath := t.TempDir()
+	cmd := exec.Command("git", "init")
+	cmd.Dir = repoPath
+	require.NoError(t, cmd.Run())
+
+	p := NewPlugin()
+	_, err := p.ExecuteProvider(context.Background(), "git", map[string]any{
+		"operation": "remote",
+		"path":      repoPath,
+		"remote":    "nonexistent",
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "remote")
 }
 
 // =============================================================================
@@ -557,6 +650,29 @@ func TestDescribeWhatIf_Tag(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, msg, "tag")
 	assert.Contains(t, msg, "v1.0.0")
+}
+
+func TestDescribeWhatIf_Remote(t *testing.T) {
+	p := NewPlugin()
+	msg, err := p.DescribeWhatIf(context.Background(), "git", map[string]any{
+		"operation": "remote",
+		"path":      "/tmp/repo",
+		"remote":    "upstream",
+	})
+	require.NoError(t, err)
+	assert.Contains(t, msg, "remote")
+	assert.Contains(t, msg, "upstream")
+	assert.Contains(t, msg, "/tmp/repo")
+}
+
+func TestDescribeWhatIf_RemoteDefaults(t *testing.T) {
+	p := NewPlugin()
+	msg, err := p.DescribeWhatIf(context.Background(), "git", map[string]any{
+		"operation": "remote",
+	})
+	require.NoError(t, err)
+	assert.Contains(t, msg, "remote")
+	assert.Contains(t, msg, "origin")
 }
 
 func TestDescribeWhatIf_DefaultOperation(t *testing.T) {

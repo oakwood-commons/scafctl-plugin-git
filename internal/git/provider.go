@@ -80,7 +80,7 @@ func buildDescriptor() *sdkprovider.Descriptor {
 		Schema: schemahelper.ObjectSchema([]string{fieldOperation}, map[string]*jsonschema.Schema{
 			fieldOperation: schemahelper.StringProp("Git operation to perform",
 				schemahelper.WithExample("clone"),
-				schemahelper.WithEnum("clone", "pull", "status", "add", "commit", "push", "checkout", "branch", "log", "tag"),
+				schemahelper.WithEnum("clone", "pull", "status", "add", "commit", "push", "checkout", "branch", "log", "tag", "remote"),
 				schemahelper.WithMaxLength(maxOp)),
 			fieldRepository: schemahelper.StringProp("Repository URL for clone operation",
 				schemahelper.WithExample("https://github.com/user/repo.git"),
@@ -122,6 +122,12 @@ func buildDescriptor() *sdkprovider.Descriptor {
 				"output":       schemahelper.StringProp("Command output"),
 				fieldOperation: schemahelper.StringProp("The operation that was performed"),
 				fieldPath:      schemahelper.StringProp("Repository path used"),
+				"url":          schemahelper.StringProp("Raw remote URL (remote operation)"),
+				"host":         schemahelper.StringProp("Remote host without userinfo or port (remote operation)"),
+				"org":          schemahelper.StringProp("Owner, group, or namespace (remote operation)"),
+				"repo":         schemahelper.StringProp("Repository name without the .git suffix (remote operation)"),
+				"httpUrl":      schemahelper.StringProp("Canonical HTTPS URL (remote operation)"),
+				"sshUrl":       schemahelper.StringProp("Canonical SSH URL (remote operation)"),
 			}),
 			sdkprovider.CapabilityAction: schemahelper.ObjectSchema(nil, map[string]*jsonschema.Schema{
 				"success":      schemahelper.BoolProp("Whether the operation succeeded"),
@@ -156,6 +162,11 @@ func buildDescriptor() *sdkprovider.Descriptor {
 				Name:        "Push with authentication",
 				Description: "Push changes to a remote repository with token authentication",
 				YAML:        "name: push-changes\nprovider: git\ninputs:\n  operation: push\n  path: /tmp/repo\n  remote: origin\n  branch: main\n  username: user\n  password: ghp_secrettoken123",
+			},
+			{
+				Name:        "Read remote metadata",
+				Description: "Resolve a repository's remote URL into structured host, org, and repo fields",
+				YAML:        "name: read-remote\nprovider: git\ninputs:\n  operation: remote\n  path: .\n  remote: origin",
 			},
 		},
 		Tags: []string{"git", "vcs", "version-control", "filesystem"},
@@ -250,6 +261,16 @@ func (p *Plugin) DescribeWhatIf(_ context.Context, name string, inputs map[strin
 	case "tag":
 		tag, _ := inputs[fieldTag].(string)
 		return fmt.Sprintf("Would create tag %q in %s", tag, path), nil
+	case "remote":
+		remote, _ := inputs[fieldRemote].(string)
+		if remote == "" {
+			remote = "origin"
+		}
+		target := path
+		if target == "" {
+			target = "."
+		}
+		return fmt.Sprintf("Would read remote %q metadata in %s", remote, target), nil
 	default:
 		if path != "" {
 			return fmt.Sprintf("Would perform git %s on %s", operation, path), nil
@@ -294,6 +315,8 @@ func executeGitOperation(ctx context.Context, operation string, inputs map[strin
 		return executeLog(ctx, inputs)
 	case "tag":
 		return executeTag(ctx, inputs)
+	case "remote":
+		return executeRemote(ctx, inputs)
 	default:
 		return nil, fmt.Errorf("unsupported operation: %s", operation)
 	}
@@ -510,6 +533,55 @@ func executeTag(ctx context.Context, inputs map[string]any) (*sdkprovider.Output
 	}
 
 	return runGitCommand(ctx, path, args, "tag", nil)
+}
+
+func executeRemote(ctx context.Context, inputs map[string]any) (*sdkprovider.Output, error) {
+	path, _ := inputs[fieldPath].(string)
+	if path == "" {
+		path = "."
+	}
+
+	remote, _ := inputs[fieldRemote].(string)
+	if remote == "" {
+		remote = "origin"
+	}
+
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return nil, fmt.Errorf("directory does not exist: %s", path)
+	}
+
+	result, err := runGitCommand(ctx, path, []string{"remote", "get-url", "--", remote}, "remote", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	data, _ := result.Data.(map[string]any)
+	if success, _ := data["success"].(bool); !success {
+		errMsg, _ := data["error"].(string)
+		if errMsg == "" {
+			errMsg, _ = data["output"].(string)
+		}
+		return nil, fmt.Errorf("resolving remote %q: %s", remote, strings.TrimSpace(errMsg))
+	}
+
+	rawURL, _ := data["output"].(string)
+	info, err := ParseRemoteURL(rawURL)
+	if err != nil {
+		return nil, err
+	}
+
+	return &sdkprovider.Output{
+		Data: map[string]any{
+			"url":          info.URL,
+			"host":         info.Host,
+			"org":          info.Org,
+			"repo":         info.Repo,
+			"httpUrl":      info.HTTPUrl,
+			"sshUrl":       info.SSHUrl,
+			fieldOperation: "remote",
+			fieldPath:      path,
+		},
+	}, nil
 }
 
 // =============================================================================
