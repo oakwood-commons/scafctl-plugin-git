@@ -2,7 +2,6 @@ package git
 
 import (
 	"fmt"
-	"net"
 	"net/url"
 	"regexp"
 	"strings"
@@ -10,7 +9,8 @@ import (
 
 // RemoteInfo holds the parsed components of a git remote URL.
 type RemoteInfo struct {
-	// URL is the raw remote URL, unmodified.
+	// URL is the remote URL with any userinfo (credentials) removed so it is
+	// safe to surface in output, templates, and logs.
 	URL string
 	// Host is the remote host with any userinfo and port stripped
 	// (e.g. "github.com").
@@ -56,11 +56,11 @@ func ParseRemoteURL(rawURL string) (*RemoteInfo, error) {
 
 	org, repo, err := splitOrgRepo(path)
 	if err != nil {
-		return nil, fmt.Errorf("parsing remote URL %q: %w", trimmed, err)
+		return nil, fmt.Errorf("parsing remote URL %q: %w", redactURL(trimmed), err)
 	}
 
 	return &RemoteInfo{
-		URL:     trimmed,
+		URL:     redactURL(trimmed),
 		Host:    host,
 		Org:     org,
 		Repo:    repo,
@@ -78,12 +78,12 @@ func splitHostPath(rawURL string) (host, path string, err error) {
 
 	u, parseErr := url.Parse(rawURL)
 	if parseErr != nil {
-		return "", "", fmt.Errorf("parsing remote URL %q: %w", rawURL, parseErr)
+		return "", "", fmt.Errorf("parsing remote URL %q: %w", redactURL(rawURL), parseErr)
 	}
 
 	host = u.Hostname()
 	if host == "" {
-		return "", "", fmt.Errorf("remote URL %q has no host", rawURL)
+		return "", "", fmt.Errorf("remote URL %q has no host", redactURL(rawURL))
 	}
 
 	return host, u.Path, nil
@@ -106,22 +106,33 @@ func isSCPLike(rawURL string) bool {
 	return true
 }
 
-// parseSCP extracts the host (without port) and path from an SCP-like URL.
+// parseSCP extracts the host and path from an SCP-like URL. Any port is
+// captured by scpLikeRE's dedicated port group, so the host group never
+// contains it.
 func parseSCP(rawURL string) (host, path string, err error) {
 	m := scpLikeRE.FindStringSubmatch(rawURL)
 	if m == nil {
-		return "", "", fmt.Errorf("remote URL %q is not valid SCP-like syntax", rawURL)
+		return "", "", fmt.Errorf("remote URL %q is not valid SCP-like syntax", redactURL(rawURL))
 	}
 	host = m[scpLikeRE.SubexpIndex("host")]
 	path = m[scpLikeRE.SubexpIndex("path")]
 	if host == "" {
-		return "", "", fmt.Errorf("remote URL %q has no host", rawURL)
-	}
-	// Strip a bracketed IPv6 host or trailing port artifacts if present.
-	if h, _, splitErr := net.SplitHostPort(host); splitErr == nil {
-		host = h
+		return "", "", fmt.Errorf("remote URL %q has no host", redactURL(rawURL))
 	}
 	return host, path, nil
+}
+
+// redactURL removes any userinfo (which may contain credentials such as a
+// personal access token) from a scheme-based URL so it is safe to include in
+// output and error messages. Inputs that are not scheme-based URLs (e.g.
+// SCP-like syntax, which carries no password) are returned unchanged.
+func redactURL(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.User == nil {
+		return rawURL
+	}
+	u.User = nil
+	return u.String()
 }
 
 // splitOrgRepo divides a repository path into its org (namespace) and repo

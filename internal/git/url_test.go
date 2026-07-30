@@ -167,6 +167,23 @@ func TestParseRemoteURL_PreservesRawURL(t *testing.T) {
 	assert.Equal(t, "git@github.com:acme/widgets.git", info.URL)
 }
 
+func TestParseRemoteURL_RedactsCredentialsFromURL(t *testing.T) {
+	info, err := ParseRemoteURL("https://user:token@github.example.com/acme/widgets.git")
+	require.NoError(t, err)
+	assert.Equal(t, "https://github.example.com/acme/widgets.git", info.URL)
+	assert.NotContains(t, info.URL, "token")
+	assert.NotContains(t, info.URL, "user")
+}
+
+func TestParseRemoteURL_RedactsCredentialsFromError(t *testing.T) {
+	// A scheme URL with credentials but no org/repo triggers a parse error;
+	// the credentials must not appear in the error message.
+	_, err := ParseRemoteURL("https://user:sup3rsecret@github.example.com/widgets.git")
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "sup3rsecret")
+	assert.NotContains(t, err.Error(), "user:")
+}
+
 func TestParseRemoteURL_Errors(t *testing.T) {
 	tests := []struct {
 		name    string
