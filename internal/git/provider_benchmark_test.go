@@ -38,3 +38,19 @@ func BenchmarkDescribeWhatIf(b *testing.B) {
 		_, _ = p.DescribeWhatIf(context.Background(), "git", inputs)
 	}
 }
+
+func BenchmarkParseRemoteURL(b *testing.B) {
+	urls := []string{
+		"https://github.com/acme/widgets.git",
+		"git@github.com:acme/widgets.git",
+		"ssh://git@github.com:22/group/subgroup/widgets.git",
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		for _, u := range urls {
+			_, _ = ParseRemoteURL(u)
+		}
+	}
+}
