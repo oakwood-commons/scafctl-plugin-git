@@ -2,6 +2,7 @@ package git
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -37,6 +38,18 @@ func TestGetProviderDescriptor(t *testing.T) {
 	assert.Contains(t, desc.Schema.Required, "operation")
 	assert.NotNil(t, desc.OutputSchemas[sdkprovider.CapabilityAction])
 	assert.NotNil(t, desc.OutputSchemas[sdkprovider.CapabilityFrom])
+	require.NoError(t, sdkprovider.ValidateDescriptor(desc))
+	for _, cap := range []sdkprovider.Capability{sdkprovider.CapabilityFrom, sdkprovider.CapabilityAction} {
+		props := desc.OutputSchemas[cap].Properties
+		require.Contains(t, props, "currentBranch")
+		assert.Equal(t, "string", props["currentBranch"].Type)
+		require.Contains(t, props, "detached")
+		assert.Equal(t, "boolean", props["detached"].Type)
+		require.Contains(t, props, "branches")
+		assert.Equal(t, "array", props["branches"].Type)
+		require.NotNil(t, props["branches"].Items)
+		assert.Equal(t, "string", props["branches"].Items.Type)
+	}
 	assert.NotEmpty(t, desc.Examples)
 	assert.NotEmpty(t, desc.Tags)
 	assert.Contains(t, desc.SensitiveFields, "password")
@@ -309,6 +322,268 @@ func TestExecuteProvider_Branch_NonexistentPath(t *testing.T) {
 	require.Error(t, err)
 }
 
+func runTestGit(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	fullArgs := append([]string{
+		"-c", "user.name=Test User",
+		"-c", "user.email=test@example.com",
+		"-c", "commit.gpgsign=false",
+		"-c", "tag.gpgSign=false",
+	}, args...)
+	cmd := exec.Command("git", fullArgs...) //nolint:gosec // G204: test helper with controlled inputs
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	require.NoError(t, err, "git %v failed: %s", args, string(out))
+}
+
+func TestExecuteProvider_Branch_ReadOnly(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git command not available")
+	}
+
+	tests := []struct {
+		name              string
+		setup             func(t *testing.T) string
+		wantCurrentBranch string
+		wantDetached      bool
+		wantBranches      []string
+		wantOutputSubstr  string
+	}{
+		{
+			name: "checked-out branch with local branches and remote tracking ref",
+			setup: func(t *testing.T) string {
+				repoPath := t.TempDir()
+				runTestGit(t, repoPath, "init", "-b", "main")
+				runTestGit(t, repoPath, "commit", "--allow-empty", "-m", "initial")
+				runTestGit(t, repoPath, "checkout", "-b", "feat/demo")
+				runTestGit(t, repoPath, "update-ref", "refs/remotes/origin/main", "HEAD")
+				runTestGit(t, repoPath, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+				return repoPath
+			},
+			wantCurrentBranch: "feat/demo",
+			wantDetached:      false,
+			wantBranches:      []string{"feat/demo", "main"},
+			wantOutputSubstr:  "* feat/demo",
+		},
+		{
+			name: "detached HEAD checkout",
+			setup: func(t *testing.T) string {
+				repoPath := t.TempDir()
+				runTestGit(t, repoPath, "init", "-b", "main")
+				runTestGit(t, repoPath, "commit", "--allow-empty", "-m", "initial")
+				runTestGit(t, repoPath, "branch", "develop")
+				runTestGit(t, repoPath, "checkout", "--detach", "HEAD")
+				return repoPath
+			},
+			wantCurrentBranch: "",
+			wantDetached:      true,
+			wantBranches:      []string{"develop", "main"},
+		},
+		{
+			name: "newly initialized unborn branch",
+			setup: func(t *testing.T) string {
+				repoPath := t.TempDir()
+				runTestGit(t, repoPath, "init", "-b", "main")
+				return repoPath
+			},
+			wantCurrentBranch: "main",
+			wantDetached:      false,
+			wantBranches:      []string{},
+		},
+		{
+			name: "linked git worktree target",
+			setup: func(t *testing.T) string {
+				primaryPath := t.TempDir()
+				runTestGit(t, primaryPath, "init", "-b", "main")
+				runTestGit(t, primaryPath, "commit", "--allow-empty", "-m", "initial")
+				runTestGit(t, primaryPath, "branch", "other")
+
+				wtPath := filepath.Join(t.TempDir(), "wt")
+				runTestGit(t, primaryPath, "worktree", "add", "-b", "feat/worktree", wtPath, "HEAD")
+				return wtPath
+			},
+			wantCurrentBranch: "feat/worktree",
+			wantDetached:      false,
+			wantBranches:      []string{"feat/worktree", "main", "other"},
+			wantOutputSubstr:  "* feat/worktree",
+		},
+		{
+			name: "primary repository when linked git worktree exists",
+			setup: func(t *testing.T) string {
+				primaryPath := t.TempDir()
+				runTestGit(t, primaryPath, "init", "-b", "main")
+				runTestGit(t, primaryPath, "commit", "--allow-empty", "-m", "initial")
+
+				wtPath := filepath.Join(t.TempDir(), "wt")
+				runTestGit(t, primaryPath, "worktree", "add", "-b", "feat/worktree", wtPath, "HEAD")
+				return primaryPath
+			},
+			wantCurrentBranch: "main",
+			wantDetached:      false,
+			wantBranches:      []string{"feat/worktree", "main"},
+			wantOutputSubstr:  "* main",
+		},
+		{
+			name: "branch sharing name with tag",
+			setup: func(t *testing.T) string {
+				repoPath := t.TempDir()
+				runTestGit(t, repoPath, "init", "-b", "v1.0.0")
+				runTestGit(t, repoPath, "commit", "--allow-empty", "-m", "release")
+				runTestGit(t, repoPath, "tag", "v1.0.0")
+				return repoPath
+			},
+			wantCurrentBranch: "v1.0.0",
+			wantDetached:      false,
+			wantBranches:      []string{"v1.0.0"},
+		},
+	}
+
+	p := NewPlugin()
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			targetPath := tt.setup(t)
+
+			result, err := p.ExecuteProvider(context.Background(), "git", map[string]any{
+				"operation": "branch",
+				"path":      targetPath,
+			})
+			require.NoError(t, err)
+			require.NotNil(t, result)
+
+			data, ok := result.Data.(map[string]any)
+			require.True(t, ok)
+			assert.Equal(t, true, data["success"])
+			assert.Equal(t, "", data["error"])
+			assert.Equal(t, "branch", data["operation"])
+			assert.Equal(t, targetPath, data["path"])
+			assert.Equal(t, tt.wantCurrentBranch, data["currentBranch"])
+			assert.Equal(t, tt.wantDetached, data["detached"])
+
+			gotBranches, ok := data["branches"].([]string)
+			require.True(t, ok, "branches must be a non-nil []string")
+			assert.NotNil(t, gotBranches)
+			assert.Equal(t, tt.wantBranches, gotBranches)
+
+			if tt.wantOutputSubstr != "" {
+				assert.Contains(t, data["output"], tt.wantOutputSubstr)
+			}
+
+			encoded, err := json.Marshal(result)
+			require.NoError(t, err)
+			if len(tt.wantBranches) == 0 {
+				assert.Contains(t, string(encoded), `"branches":[]`)
+			}
+		})
+	}
+}
+
+func TestExecuteProvider_Branch_CreatePreservesMutationOutput(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git command not available")
+	}
+
+	repoPath := t.TempDir()
+	runTestGit(t, repoPath, "init", "-b", "main")
+	runTestGit(t, repoPath, "commit", "--allow-empty", "-m", "initial")
+
+	p := NewPlugin()
+	createRes, err := p.ExecuteProvider(context.Background(), "git", map[string]any{
+		"operation": "branch",
+		"path":      repoPath,
+		"branch":    "feat/created",
+	})
+	require.NoError(t, err)
+	createData := createRes.Data.(map[string]any)
+	assert.Equal(t, true, createData["success"])
+	assert.Equal(t, "branch", createData["operation"])
+	assert.Equal(t, repoPath, createData["path"])
+	_, hasCurrent := createData["currentBranch"]
+	assert.False(t, hasCurrent)
+	_, hasDetached := createData["detached"]
+	assert.False(t, hasDetached)
+	_, hasBranches := createData["branches"]
+	assert.False(t, hasBranches)
+
+	listRes, err := p.ExecuteProvider(context.Background(), "git", map[string]any{
+		"operation": "branch",
+		"path":      repoPath,
+	})
+	require.NoError(t, err)
+	listData := listRes.Data.(map[string]any)
+	assert.Equal(t, "main", listData["currentBranch"])
+	assert.Equal(t, false, listData["detached"])
+	assert.Equal(t, []string{"feat/created", "main"}, listData["branches"])
+
+	flagRes, err := p.ExecuteProvider(context.Background(), "git", map[string]any{
+		"operation": "branch",
+		"path":      repoPath,
+		"branch":    "--show-current",
+	})
+	require.NoError(t, err)
+	flagData := flagRes.Data.(map[string]any)
+	assert.Equal(t, false, flagData["success"])
+}
+
+func TestExecuteProvider_Branch_NotGitRepository(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git command not available")
+	}
+
+	emptyDir := t.TempDir()
+	p := NewPlugin()
+	result, err := p.ExecuteProvider(context.Background(), "git", map[string]any{
+		"operation": "branch",
+		"path":      emptyDir,
+	})
+	require.NoError(t, err)
+	data := result.Data.(map[string]any)
+	assert.Equal(t, false, data["success"])
+	assert.NotEmpty(t, data["error"])
+	_, hasCurrent := data["currentBranch"]
+	assert.False(t, hasCurrent)
+}
+
+func TestExecuteProvider_Branch_CanceledContext(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git command not available")
+	}
+
+	repoPath := t.TempDir()
+	runTestGit(t, repoPath, "init", "-b", "main")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, _, _, err := resolveBranchMetadata(ctx, repoPath)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, context.Canceled)
+
+	p := NewPlugin()
+	_, execErr := p.ExecuteProvider(ctx, "git", map[string]any{
+		"operation": "branch",
+		"path":      repoPath,
+	})
+	require.Error(t, execErr)
+}
+
+func TestResolveBranchMetadata_NonHeadSymbolicRef(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git command not available")
+	}
+
+	repoPath := t.TempDir()
+	runTestGit(t, repoPath, "init", "-b", "main")
+	runTestGit(t, repoPath, "commit", "--allow-empty", "-m", "initial")
+	runTestGit(t, repoPath, "update-ref", "refs/custom/preview", "HEAD")
+	runTestGit(t, repoPath, "symbolic-ref", "HEAD", "refs/custom/preview")
+
+	currentBranch, detached, branches, err := resolveBranchMetadata(context.Background(), repoPath)
+	require.NoError(t, err)
+	assert.Equal(t, "", currentBranch)
+	assert.True(t, detached)
+	assert.Equal(t, []string{"main"}, branches)
+}
+
 func TestExecuteProvider_Tag_NonexistentPath(t *testing.T) {
 	p := NewPlugin()
 	_, err := p.ExecuteProvider(context.Background(), "git", map[string]any{
@@ -556,6 +831,24 @@ func TestDryRun_Branch(t *testing.T) {
 	assert.True(t, data["_dryRun"].(bool))
 	assert.Contains(t, data["_message"].(string), "branch")
 	assert.Contains(t, data["_message"].(string), "new-branch")
+	_, hasCurrent := data["currentBranch"]
+	assert.False(t, hasCurrent)
+}
+
+func TestDryRun_Branch_ReadOnly(t *testing.T) {
+	p := NewPlugin()
+	ctx := sdkprovider.WithDryRun(context.Background(), true)
+
+	result, err := p.ExecuteProvider(ctx, "git", map[string]any{
+		"operation": "branch",
+		"path":      "/tmp/repo",
+	})
+	require.NoError(t, err)
+	data := result.Data.(map[string]any)
+	assert.True(t, data["_dryRun"].(bool))
+	assert.Equal(t, "", data["currentBranch"])
+	assert.Equal(t, false, data["detached"])
+	assert.Equal(t, []string{}, data["branches"])
 }
 
 func TestDryRun_CloneDepthFloat(t *testing.T) {
@@ -638,6 +931,42 @@ func TestDescribeWhatIf_Checkout(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, msg, "checkout")
 	assert.Contains(t, msg, "feature")
+}
+
+func TestDescribeWhatIf_Branch(t *testing.T) {
+	p := NewPlugin()
+
+	listMsg, err := p.DescribeWhatIf(context.Background(), "git", map[string]any{
+		"operation": "branch",
+		"path":      "/tmp/repo",
+	})
+	require.NoError(t, err)
+	assert.Contains(t, listMsg, "list branches")
+	assert.Contains(t, listMsg, "/tmp/repo")
+
+	listNoPathMsg, err := p.DescribeWhatIf(context.Background(), "git", map[string]any{
+		"operation": "branch",
+	})
+	require.NoError(t, err)
+	assert.Contains(t, listNoPathMsg, "list branches")
+
+	createMsg, err := p.DescribeWhatIf(context.Background(), "git", map[string]any{
+		"operation": "branch",
+		"path":      "/tmp/repo",
+		"branch":    "feat/demo",
+	})
+	require.NoError(t, err)
+	assert.Contains(t, createMsg, "create branch")
+	assert.Contains(t, createMsg, "feat/demo")
+	assert.Contains(t, createMsg, "/tmp/repo")
+
+	createNoPathMsg, err := p.DescribeWhatIf(context.Background(), "git", map[string]any{
+		"operation": "branch",
+		"branch":    "feat/demo",
+	})
+	require.NoError(t, err)
+	assert.Contains(t, createNoPathMsg, "create branch")
+	assert.Contains(t, createNoPathMsg, "feat/demo")
 }
 
 func TestDescribeWhatIf_Tag(t *testing.T) {
