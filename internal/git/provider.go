@@ -119,22 +119,30 @@ func buildDescriptor() *sdkprovider.Descriptor {
 		}),
 		OutputSchemas: map[sdkprovider.Capability]*jsonschema.Schema{
 			sdkprovider.CapabilityFrom: schemahelper.ObjectSchema(nil, map[string]*jsonschema.Schema{
-				"output":       schemahelper.StringProp("Command output"),
-				fieldOperation: schemahelper.StringProp("The operation that was performed"),
-				fieldPath:      schemahelper.StringProp("Repository path used"),
-				"url":          schemahelper.StringProp("Raw remote URL (remote operation)"),
-				"host":         schemahelper.StringProp("Remote host without userinfo or port (remote operation)"),
-				"org":          schemahelper.StringProp("Owner, group, or namespace (remote operation)"),
-				"repo":         schemahelper.StringProp("Repository name without the .git suffix (remote operation)"),
-				"httpUrl":      schemahelper.StringProp("Canonical HTTPS URL (remote operation)"),
-				"sshUrl":       schemahelper.StringProp("Canonical SSH URL (remote operation)"),
+				"output":        schemahelper.StringProp("Command output"),
+				fieldOperation:  schemahelper.StringProp("The operation that was performed"),
+				fieldPath:       schemahelper.StringProp("Repository path used"),
+				"url":           schemahelper.StringProp("Raw remote URL (remote operation)"),
+				"host":          schemahelper.StringProp("Remote host without userinfo or port (remote operation)"),
+				"org":           schemahelper.StringProp("Owner, group, or namespace (remote operation)"),
+				"repo":          schemahelper.StringProp("Repository name without the .git suffix (remote operation)"),
+				"httpUrl":       schemahelper.StringProp("Canonical HTTPS URL (remote operation)"),
+				"sshUrl":        schemahelper.StringProp("Canonical SSH URL (remote operation)"),
+				"currentBranch": schemahelper.StringProp("Checked-out local branch name, or empty string when HEAD is detached (branch operation)"),
+				"detached":      schemahelper.BoolProp("Whether HEAD is detached (branch operation)"),
+				"branches": schemahelper.ArrayProp("Local branch names (branch operation)",
+					schemahelper.WithItems(schemahelper.StringProp("Local branch name"))),
 			}),
 			sdkprovider.CapabilityAction: schemahelper.ObjectSchema(nil, map[string]*jsonschema.Schema{
-				"success":      schemahelper.BoolProp("Whether the operation succeeded"),
-				"output":       schemahelper.StringProp("Command output"),
-				"error":        schemahelper.StringProp("Error message if operation failed"),
-				fieldOperation: schemahelper.StringProp("The operation that was performed"),
-				fieldPath:      schemahelper.StringProp("Repository path used"),
+				"success":       schemahelper.BoolProp("Whether the operation succeeded"),
+				"output":        schemahelper.StringProp("Command output"),
+				"error":         schemahelper.StringProp("Error message if operation failed"),
+				fieldOperation:  schemahelper.StringProp("The operation that was performed"),
+				fieldPath:       schemahelper.StringProp("Repository path used"),
+				"currentBranch": schemahelper.StringProp("Checked-out local branch name, or empty string when HEAD is detached (branch operation)"),
+				"detached":      schemahelper.BoolProp("Whether HEAD is detached (branch operation)"),
+				"branches": schemahelper.ArrayProp("Local branch names (branch operation)",
+					schemahelper.WithItems(schemahelper.StringProp("Local branch name"))),
 			}),
 		},
 		Examples: []sdkprovider.Example{
@@ -167,6 +175,11 @@ func buildDescriptor() *sdkprovider.Descriptor {
 				Name:        "Read remote metadata",
 				Description: "Resolve a repository's remote URL into structured host, org, and repo fields",
 				YAML:        "name: read-remote\nprovider: git\ninputs:\n  operation: remote\n  path: .\n  remote: origin",
+			},
+			{
+				Name:        "Inspect branches",
+				Description: "Read the checked-out branch, detached HEAD state, and local branch names",
+				YAML:        "name: inspect-branches\nprovider: git\ninputs:\n  operation: branch\n  path: .",
 			},
 		},
 		Tags: []string{"git", "vcs", "version-control", "filesystem"},
@@ -258,6 +271,17 @@ func (p *Plugin) DescribeWhatIf(_ context.Context, name string, inputs map[strin
 	case "checkout":
 		branch, _ := inputs[fieldBranch].(string)
 		return fmt.Sprintf("Would checkout branch %q in %s", branch, path), nil
+	case "branch":
+		if branch, ok := inputs[fieldBranch].(string); ok && branch != "" {
+			if path != "" {
+				return fmt.Sprintf("Would create branch %q in %s", branch, path), nil
+			}
+			return fmt.Sprintf("Would create branch %q", branch), nil
+		}
+		if path != "" {
+			return fmt.Sprintf("Would list branches in %s", path), nil
+		}
+		return "Would list branches", nil
 	case "tag":
 		tag, _ := inputs[fieldTag].(string)
 		return fmt.Sprintf("Would create tag %q in %s", tag, path), nil
@@ -493,15 +517,95 @@ func executeBranch(ctx context.Context, inputs map[string]any) (*sdkprovider.Out
 		return nil, fmt.Errorf("path is required for branch operation")
 	}
 
-	args := []string{"branch"}
-
 	if branch, ok := inputs[fieldBranch].(string); ok && branch != "" {
-		args = append(args, branch)
-	} else {
-		args = append(args, "-a")
+		return runGitCommand(ctx, path, []string{"branch", "--", branch}, "branch", nil)
 	}
 
-	return runGitCommand(ctx, path, args, "branch", nil)
+	result, err := runGitCommand(ctx, path, []string{"branch", "-a"}, "branch", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	data, _ := result.Data.(map[string]any)
+	if success, _ := data["success"].(bool); !success {
+		return result, nil
+	}
+
+	currentBranch, detached, branches, err := resolveBranchMetadata(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+
+	data["currentBranch"] = currentBranch
+	data["detached"] = detached
+	data["branches"] = branches
+
+	return result, nil
+}
+
+// resolveBranchMetadata inspects HEAD and refs/heads in path without relying on
+// human-oriented git branch formatting prefixes such as "* " or linked-worktree "+ ".
+// Stripping refs/heads/ directly and using lstrip=2 avoids "heads/<name>"
+// disambiguation prefixes when a tag shares the same short name as a branch.
+func resolveBranchMetadata(ctx context.Context, path string) (currentBranch string, detached bool, branches []string, err error) {
+	symCmd := exec.CommandContext(ctx, "git", "symbolic-ref", "--quiet", "HEAD")
+	symCmd.Dir = path
+	var symOut, symErr bytes.Buffer
+	symCmd.Stdout = &symOut
+	symCmd.Stderr = &symErr
+
+	if runErr := symCmd.Run(); runErr != nil {
+		if ctx.Err() != nil {
+			return "", false, nil, fmt.Errorf("resolving current branch: %w", ctx.Err())
+		}
+		var exitErr *exec.ExitError
+		if errors.As(runErr, &exitErr) && exitErr.ExitCode() == 1 {
+			currentBranch = ""
+			detached = true
+		} else {
+			errMsg := strings.TrimSpace(symErr.String())
+			if errMsg != "" {
+				return "", false, nil, fmt.Errorf("resolving current branch: %s: %w", errMsg, runErr)
+			}
+			return "", false, nil, fmt.Errorf("resolving current branch: %w", runErr)
+		}
+	} else {
+		ref := strings.TrimRight(symOut.String(), "\r\n")
+		if branch, ok := strings.CutPrefix(ref, "refs/heads/"); ok {
+			currentBranch = branch
+			detached = false
+		} else {
+			currentBranch = ""
+			detached = true
+		}
+	}
+
+	refCmd := exec.CommandContext(ctx, "git", "for-each-ref", "--format=%(refname:lstrip=2)", "refs/heads")
+	refCmd.Dir = path
+	var refOut, refErr bytes.Buffer
+	refCmd.Stdout = &refOut
+	refCmd.Stderr = &refErr
+
+	if runErr := refCmd.Run(); runErr != nil {
+		if ctx.Err() != nil {
+			return "", false, nil, fmt.Errorf("listing local branches: %w", ctx.Err())
+		}
+		errMsg := strings.TrimSpace(refErr.String())
+		if errMsg != "" {
+			return "", false, nil, fmt.Errorf("listing local branches: %s: %w", errMsg, runErr)
+		}
+		return "", false, nil, fmt.Errorf("listing local branches: %w", runErr)
+	}
+
+	branches = []string{}
+	for _, line := range strings.Split(refOut.String(), "\n") {
+		name := strings.TrimRight(line, "\r")
+		if name != "" {
+			branches = append(branches, name)
+		}
+	}
+
+	return currentBranch, detached, branches, nil
 }
 
 func executeLog(ctx context.Context, inputs map[string]any) (*sdkprovider.Output, error) {
@@ -657,21 +761,28 @@ func executeDryRun(operation string, inputs map[string]any) *sdkprovider.Output 
 		message += fmt.Sprintf(" at path: %s", path)
 	}
 
-	if branch, ok := inputs[fieldBranch].(string); ok && branch != "" {
+	branch, _ := inputs[fieldBranch].(string)
+	if branch != "" {
 		message += fmt.Sprintf(" for branch: %s", branch)
 	}
 
-	return &sdkprovider.Output{
-		Data: map[string]any{
-			"success":      true,
-			"output":       "",
-			"error":        "",
-			fieldOperation: operation,
-			fieldPath:      inputs[fieldPath],
-			"_dryRun":      true,
-			"_message":     message,
-		},
+	data := map[string]any{
+		"success":      true,
+		"output":       "",
+		"error":        "",
+		fieldOperation: operation,
+		fieldPath:      inputs[fieldPath],
+		"_dryRun":      true,
+		"_message":     message,
 	}
+
+	if operation == "branch" && branch == "" {
+		data["currentBranch"] = ""
+		data["detached"] = false
+		data["branches"] = []string{}
+	}
+
+	return &sdkprovider.Output{Data: data}
 }
 
 // =============================================================================
