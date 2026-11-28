@@ -38,6 +38,9 @@ const (
 	fieldUsername   = "username"
 	fieldPassword   = "password"
 	fieldForce      = "force"
+	fieldBase       = "base"
+	fieldHead       = "head"
+	fieldThreeDot   = "three_dot"
 )
 
 // Plugin implements the sdkplugin.ProviderPlugin interface for git operations.
@@ -65,6 +68,21 @@ func buildDescriptor() *sdkprovider.Descriptor {
 	maxDepth := 10000.0
 	maxUser := 200
 	maxPass := 500
+	maxRef := 250
+
+	diffFilesOutputSchema := func() *jsonschema.Schema {
+		return schemahelper.ArrayProp("Per-file change statistics (diff operation)",
+			schemahelper.WithItems(schemahelper.ObjectProp("Changed file statistics",
+				[]string{"path", "additions", "deletions", "binary"},
+				map[string]*jsonschema.Schema{
+					"path":      schemahelper.StringProp("File path relative to repository root"),
+					"oldPath":   schemahelper.StringProp("Previous file path when the file was renamed or copied"),
+					"additions": schemahelper.IntProp("Number of added lines (0 for binary files)"),
+					"deletions": schemahelper.IntProp("Number of deleted lines (0 for binary files)"),
+					"binary":    schemahelper.BoolProp("Whether the file was treated as binary by git diff"),
+				},
+			)))
+	}
 
 	return &sdkprovider.Descriptor{
 		Name:        ProviderName,
@@ -80,12 +98,12 @@ func buildDescriptor() *sdkprovider.Descriptor {
 		Schema: schemahelper.ObjectSchema([]string{fieldOperation}, map[string]*jsonschema.Schema{
 			fieldOperation: schemahelper.StringProp("Git operation to perform",
 				schemahelper.WithExample("clone"),
-				schemahelper.WithEnum("clone", "pull", "status", "add", "commit", "push", "checkout", "branch", "log", "tag", "remote"),
+				schemahelper.WithEnum("clone", "pull", "status", "add", "commit", "push", "checkout", "branch", "log", "tag", "remote", "diff", "merge-check"),
 				schemahelper.WithMaxLength(maxOp)),
 			fieldRepository: schemahelper.StringProp("Repository URL for clone operation",
 				schemahelper.WithExample("https://github.com/user/repo.git"),
 				schemahelper.WithMaxLength(maxRepo)),
-			fieldPath: schemahelper.StringProp("Local path for repository",
+			fieldPath: schemahelper.StringProp("Local path for repository (defaults to \".\" for remote, diff, and merge-check)",
 				schemahelper.WithExample("/tmp/repo"),
 				schemahelper.WithMaxLength(maxPath)),
 			fieldBranch: schemahelper.StringProp("Branch name",
@@ -116,10 +134,21 @@ func buildDescriptor() *sdkprovider.Descriptor {
 			fieldForce: schemahelper.BoolProp("Force the operation",
 				schemahelper.WithExample("false"),
 				schemahelper.WithDefault(false)),
+			fieldBase: schemahelper.StringProp("Base Git revision or branch ref (optional for diff; required for merge-check)",
+				schemahelper.WithExample("main"),
+				schemahelper.WithMaxLength(maxRef)),
+			fieldHead: schemahelper.StringProp("Head Git revision or branch ref (defaults to HEAD when omitted)",
+				schemahelper.WithExample("HEAD"),
+				schemahelper.WithMaxLength(maxRef)),
+			fieldThreeDot: schemahelper.BoolProp("Compare against merge-base (base...head) instead of direct two-dot diff (base..head) when base is set",
+				schemahelper.WithExample(true),
+				schemahelper.WithDefault(true)),
 		}),
 		OutputSchemas: map[sdkprovider.Capability]*jsonschema.Schema{
 			sdkprovider.CapabilityFrom: schemahelper.ObjectSchema(nil, map[string]*jsonschema.Schema{
+				"success":       schemahelper.BoolProp("Whether the operation succeeded"),
 				"output":        schemahelper.StringProp("Command output"),
+				"error":         schemahelper.StringProp("Error message if operation failed"),
 				fieldOperation:  schemahelper.StringProp("The operation that was performed"),
 				fieldPath:       schemahelper.StringProp("Repository path used"),
 				"url":           schemahelper.StringProp("Raw remote URL (remote operation)"),
@@ -132,6 +161,14 @@ func buildDescriptor() *sdkprovider.Descriptor {
 				"detached":      schemahelper.BoolProp("Whether HEAD is detached (branch operation)"),
 				"branches": schemahelper.ArrayProp("Local branch names (branch operation)",
 					schemahelper.WithItems(schemahelper.StringProp("Local branch name"))),
+				fieldFiles:       diffFilesOutputSchema(),
+				"changedFiles":   schemahelper.IntProp("Total number of changed files (diff operation)"),
+				"totalAdditions": schemahelper.IntProp("Total added lines across non-binary files (diff operation)"),
+				"totalDeletions": schemahelper.IntProp("Total deleted lines across non-binary files (diff operation)"),
+				"clean":          schemahelper.BoolProp("Whether the 3-way merge succeeded without conflicts (merge-check operation)"),
+				"treeOid":        schemahelper.StringProp("Resulting merged tree object ID when clean is true (merge-check operation)"),
+				"conflictedFiles": schemahelper.ArrayProp("Sorted list of conflicted file paths when clean is false (merge-check operation)",
+					schemahelper.WithItems(schemahelper.StringProp("Conflicted file path"))),
 			}),
 			sdkprovider.CapabilityAction: schemahelper.ObjectSchema(nil, map[string]*jsonschema.Schema{
 				"success":       schemahelper.BoolProp("Whether the operation succeeded"),
@@ -143,6 +180,14 @@ func buildDescriptor() *sdkprovider.Descriptor {
 				"detached":      schemahelper.BoolProp("Whether HEAD is detached (branch operation)"),
 				"branches": schemahelper.ArrayProp("Local branch names (branch operation)",
 					schemahelper.WithItems(schemahelper.StringProp("Local branch name"))),
+				fieldFiles:       diffFilesOutputSchema(),
+				"changedFiles":   schemahelper.IntProp("Total number of changed files (diff operation)"),
+				"totalAdditions": schemahelper.IntProp("Total added lines across non-binary files (diff operation)"),
+				"totalDeletions": schemahelper.IntProp("Total deleted lines across non-binary files (diff operation)"),
+				"clean":          schemahelper.BoolProp("Whether the 3-way merge succeeded without conflicts (merge-check operation)"),
+				"treeOid":        schemahelper.StringProp("Resulting merged tree object ID when clean is true (merge-check operation)"),
+				"conflictedFiles": schemahelper.ArrayProp("Sorted list of conflicted file paths when clean is false (merge-check operation)",
+					schemahelper.WithItems(schemahelper.StringProp("Conflicted file path"))),
 			}),
 		},
 		Examples: []sdkprovider.Example{
@@ -180,6 +225,16 @@ func buildDescriptor() *sdkprovider.Descriptor {
 				Name:        "Inspect branches",
 				Description: "Read the checked-out branch, detached HEAD state, and local branch names",
 				YAML:        "name: inspect-branches\nprovider: git\ninputs:\n  operation: branch\n  path: .",
+			},
+			{
+				Name:        "Diff changes between refs",
+				Description: "Read per-file line additions, deletions, binary status, and totals between two Git refs",
+				YAML:        "name: diff-changes\nprovider: git\ninputs:\n  operation: diff\n  path: .\n  base: HEAD~1\n  head: HEAD",
+			},
+			{
+				Name:        "Check 3-way merge conflicts",
+				Description: "Verify whether a branch merges cleanly into a base ref without modifying the working tree",
+				YAML:        "name: check-merge\nprovider: git\ninputs:\n  operation: merge-check\n  path: .\n  base: origin/main\n  head: HEAD",
 			},
 		},
 		Tags: []string{"git", "vcs", "version-control", "filesystem"},
@@ -223,7 +278,7 @@ func (p *Plugin) ExecuteProvider(ctx context.Context, name string, inputs map[st
 	lgr.V(1).Info("executing provider", "provider", ProviderName, "operation", operation)
 
 	if dryRun := sdkprovider.DryRunFromContext(ctx); dryRun {
-		result := executeDryRun(operation, inputs)
+		result := executeDryRun(ctx, operation, inputs)
 		lgr.V(1).Info("provider completed (dry-run)", "provider", ProviderName)
 		return result, nil
 	}
@@ -243,7 +298,7 @@ func (p *Plugin) ExecuteProviderStream(_ context.Context, _ string, _ map[string
 }
 
 // DescribeWhatIf returns a human-readable description of what the operation would do.
-func (p *Plugin) DescribeWhatIf(_ context.Context, name string, inputs map[string]any) (string, error) {
+func (p *Plugin) DescribeWhatIf(ctx context.Context, name string, inputs map[string]any) (string, error) {
 	if name != ProviderName {
 		return "", fmt.Errorf("unknown provider: %s", name)
 	}
@@ -295,6 +350,32 @@ func (p *Plugin) DescribeWhatIf(_ context.Context, name string, inputs map[strin
 			target = "."
 		}
 		return fmt.Sprintf("Would read remote %q metadata in %s", remote, target), nil
+	case "diff":
+		target := resolveRepoPath(ctx, path)
+		base, _ := inputs[fieldBase].(string)
+		head, _ := inputs[fieldHead].(string)
+		if base != "" {
+			if head == "" {
+				head = "HEAD"
+			}
+			sep := "..."
+			if threeDot, ok := inputs[fieldThreeDot].(bool); ok && !threeDot {
+				sep = ".."
+			}
+			return fmt.Sprintf("Would diff %s%s%s in %s", base, sep, head, target), nil
+		}
+		if head != "" {
+			return fmt.Sprintf("Would diff working tree against %s in %s", head, target), nil
+		}
+		return fmt.Sprintf("Would diff working tree against HEAD in %s", target), nil
+	case "merge-check":
+		target := resolveRepoPath(ctx, path)
+		base, _ := inputs[fieldBase].(string)
+		head, _ := inputs[fieldHead].(string)
+		if head == "" {
+			head = "HEAD"
+		}
+		return fmt.Sprintf("Would check 3-way merge of %s into %s in %s", head, base, target), nil
 	default:
 		if path != "" {
 			return fmt.Sprintf("Would perform git %s on %s", operation, path), nil
@@ -341,6 +422,10 @@ func executeGitOperation(ctx context.Context, operation string, inputs map[strin
 		return executeTag(ctx, inputs)
 	case "remote":
 		return executeRemote(ctx, inputs)
+	case "diff":
+		return executeDiff(ctx, inputs)
+	case "merge-check":
+		return executeMergeCheck(ctx, inputs)
 	default:
 		return nil, fmt.Errorf("unsupported operation: %s", operation)
 	}
@@ -750,7 +835,7 @@ func runGitCommand(ctx context.Context, workDir string, args []string, operation
 // Dry-run
 // =============================================================================
 
-func executeDryRun(operation string, inputs map[string]any) *sdkprovider.Output {
+func executeDryRun(ctx context.Context, operation string, inputs map[string]any) *sdkprovider.Output {
 	message := fmt.Sprintf("Would execute git %s", operation)
 
 	if repository, ok := inputs[fieldRepository].(string); ok && repository != "" {
@@ -766,6 +851,12 @@ func executeDryRun(operation string, inputs map[string]any) *sdkprovider.Output 
 		message += fmt.Sprintf(" for branch: %s", branch)
 	}
 
+	base, _ := inputs[fieldBase].(string)
+	head, _ := inputs[fieldHead].(string)
+	if base != "" || head != "" {
+		message += fmt.Sprintf(" (base: %s, head: %s)", base, head)
+	}
+
 	data := map[string]any{
 		"success":      true,
 		"output":       "",
@@ -776,10 +867,24 @@ func executeDryRun(operation string, inputs map[string]any) *sdkprovider.Output 
 		"_message":     message,
 	}
 
-	if operation == "branch" && branch == "" {
+	switch {
+	case operation == "branch" && branch == "":
 		data["currentBranch"] = ""
 		data["detached"] = false
 		data["branches"] = []string{}
+	case operation == "diff":
+		rawPath, _ := inputs[fieldPath].(string)
+		data[fieldPath] = resolveRepoPath(ctx, rawPath)
+		data[fieldFiles] = []map[string]any{}
+		data["changedFiles"] = 0
+		data["totalAdditions"] = 0
+		data["totalDeletions"] = 0
+	case operation == "merge-check":
+		rawPath, _ := inputs[fieldPath].(string)
+		data[fieldPath] = resolveRepoPath(ctx, rawPath)
+		data["clean"] = true
+		data["treeOid"] = ""
+		data["conflictedFiles"] = []string{}
 	}
 
 	return &sdkprovider.Output{Data: data}

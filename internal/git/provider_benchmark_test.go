@@ -86,3 +86,63 @@ func BenchmarkExecuteProvider_Branch(b *testing.B) {
 		_, _ = p.ExecuteProvider(context.Background(), "git", inputs)
 	}
 }
+
+func BenchmarkParseNumstatZ(b *testing.B) {
+	sample := []byte("12\t4\tinternal/git/provider.go\x00-\t-\tassets/logo.png\x003\t1\t\x00old dir/a.go\x00new dir/a.go\x00")
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		_, _, _, _, _ = parseNumstatZ(sample)
+	}
+}
+
+func BenchmarkExecuteProvider_DiffAndMergeCheck(b *testing.B) {
+	if _, err := exec.LookPath("git"); err != nil {
+		b.Skip("git command not available")
+	}
+
+	repoPath := b.TempDir()
+	for _, args := range [][]string{
+		{"init", "-b", "main"},
+		{"-c", "user.name=Bench", "-c", "user.email=bench@example.com", "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "base"},
+		{"checkout", "-b", "feat/bench"},
+		{"-c", "user.name=Bench", "-c", "user.email=bench@example.com", "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "head"},
+	} {
+		cmd := exec.Command("git", args...) //nolint:gosec // G204: benchmark setup with static args
+		cmd.Dir = repoPath
+		if out, err := cmd.CombinedOutput(); err != nil {
+			b.Fatalf("git %v failed: %s", args, string(out))
+		}
+	}
+
+	p := NewPlugin()
+
+	b.Run("diff", func(b *testing.B) {
+		inputs := map[string]any{
+			"operation": "diff",
+			"path":      repoPath,
+			"base":      "main",
+			"head":      "feat/bench",
+		}
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			_, _ = p.ExecuteProvider(context.Background(), "git", inputs)
+		}
+	})
+
+	b.Run("merge-check", func(b *testing.B) {
+		inputs := map[string]any{
+			"operation": "merge-check",
+			"path":      repoPath,
+			"base":      "main",
+			"head":      "feat/bench",
+		}
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			_, _ = p.ExecuteProvider(context.Background(), "git", inputs)
+		}
+	})
+}

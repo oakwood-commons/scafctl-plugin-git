@@ -49,7 +49,32 @@ func TestGetProviderDescriptor(t *testing.T) {
 		assert.Equal(t, "array", props["branches"].Type)
 		require.NotNil(t, props["branches"].Items)
 		assert.Equal(t, "string", props["branches"].Items.Type)
+
+		require.Contains(t, props, "files")
+		assert.Equal(t, "array", props["files"].Type)
+		require.NotNil(t, props["files"].Items)
+		assert.Equal(t, "object", props["files"].Items.Type)
+		require.Contains(t, props, "changedFiles")
+		assert.Equal(t, "integer", props["changedFiles"].Type)
+		require.Contains(t, props, "totalAdditions")
+		assert.Equal(t, "integer", props["totalAdditions"].Type)
+		require.Contains(t, props, "totalDeletions")
+		assert.Equal(t, "integer", props["totalDeletions"].Type)
+
+		require.Contains(t, props, "clean")
+		assert.Equal(t, "boolean", props["clean"].Type)
+		require.Contains(t, props, "treeOid")
+		assert.Equal(t, "string", props["treeOid"].Type)
+		require.Contains(t, props, "conflictedFiles")
+		assert.Equal(t, "array", props["conflictedFiles"].Type)
+		require.NotNil(t, props["conflictedFiles"].Items)
+		assert.Equal(t, "string", props["conflictedFiles"].Items.Type)
 	}
+	require.Contains(t, desc.Schema.Properties, "base")
+	require.Contains(t, desc.Schema.Properties, "head")
+	require.Contains(t, desc.Schema.Properties, "three_dot")
+	assert.Contains(t, desc.Schema.Properties["operation"].Enum, "diff")
+	assert.Contains(t, desc.Schema.Properties["operation"].Enum, "merge-check")
 	assert.NotEmpty(t, desc.Examples)
 	assert.NotEmpty(t, desc.Tags)
 	assert.Contains(t, desc.SensitiveFields, "password")
@@ -851,6 +876,38 @@ func TestDryRun_Branch_ReadOnly(t *testing.T) {
 	assert.Equal(t, []string{}, data["branches"])
 }
 
+func TestDryRun_DiffAndMergeCheck(t *testing.T) {
+	p := NewPlugin()
+	ctx := sdkprovider.WithDryRun(context.Background(), true)
+
+	diffRes, err := p.ExecuteProvider(ctx, "git", map[string]any{
+		"operation": "diff",
+		"base":      "main",
+		"head":      "HEAD",
+	})
+	require.NoError(t, err)
+	diffData := diffRes.Data.(map[string]any)
+	assert.Equal(t, true, diffData["_dryRun"])
+	assert.Equal(t, ".", diffData["path"])
+	assert.Equal(t, []map[string]any{}, diffData["files"])
+	assert.Equal(t, 0, diffData["changedFiles"])
+	assert.Equal(t, 0, diffData["totalAdditions"])
+	assert.Equal(t, 0, diffData["totalDeletions"])
+	assert.Contains(t, diffData["_message"], "base: main")
+
+	mergeRes, err := p.ExecuteProvider(ctx, "git", map[string]any{
+		"operation": "merge-check",
+		"base":      "origin/main",
+	})
+	require.NoError(t, err)
+	mergeData := mergeRes.Data.(map[string]any)
+	assert.Equal(t, true, mergeData["_dryRun"])
+	assert.Equal(t, ".", mergeData["path"])
+	assert.Equal(t, true, mergeData["clean"])
+	assert.Equal(t, "", mergeData["treeOid"])
+	assert.Equal(t, []string{}, mergeData["conflictedFiles"])
+}
+
 func TestDryRun_CloneDepthFloat(t *testing.T) {
 	p := NewPlugin()
 	ctx := sdkprovider.WithDryRun(context.Background(), true)
@@ -1002,6 +1059,49 @@ func TestDescribeWhatIf_RemoteDefaults(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, msg, "remote")
 	assert.Contains(t, msg, "origin")
+}
+
+func TestDescribeWhatIf_DiffAndMergeCheck(t *testing.T) {
+	p := NewPlugin()
+
+	threeDotMsg, err := p.DescribeWhatIf(context.Background(), "git", map[string]any{
+		"operation": "diff",
+		"path":      "/tmp/repo",
+		"base":      "main",
+		"head":      "feature",
+	})
+	require.NoError(t, err)
+	assert.Contains(t, threeDotMsg, "main...feature")
+	assert.Contains(t, threeDotMsg, "/tmp/repo")
+
+	twoDotMsg, err := p.DescribeWhatIf(context.Background(), "git", map[string]any{
+		"operation": "diff",
+		"base":      "main",
+		"three_dot": false,
+	})
+	require.NoError(t, err)
+	assert.Contains(t, twoDotMsg, "main..HEAD")
+	assert.Contains(t, twoDotMsg, ".")
+
+	wtHeadMsg, err := p.DescribeWhatIf(context.Background(), "git", map[string]any{
+		"operation": "diff",
+		"head":      "HEAD~1",
+	})
+	require.NoError(t, err)
+	assert.Contains(t, wtHeadMsg, "working tree against HEAD~1")
+
+	wtDefaultMsg, err := p.DescribeWhatIf(context.Background(), "git", map[string]any{
+		"operation": "diff",
+	})
+	require.NoError(t, err)
+	assert.Contains(t, wtDefaultMsg, "working tree against HEAD")
+
+	mergeMsg, err := p.DescribeWhatIf(context.Background(), "git", map[string]any{
+		"operation": "merge-check",
+		"base":      "origin/main",
+	})
+	require.NoError(t, err)
+	assert.Contains(t, mergeMsg, "HEAD into origin/main")
 }
 
 func TestDescribeWhatIf_DefaultOperation(t *testing.T) {
